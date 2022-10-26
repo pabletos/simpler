@@ -27,10 +27,9 @@ def _mysql_converter():
 
 		def _STRING_to_python(self, value, dsc=None):
 			res = super(MySQLConverter, self)._STRING_to_python(value, dsc)
-			if dsc[7] & FieldFlag.BINARY:
-				return res.decode(self.charset)
 			return res
 		_VAR_STRING_to_python = _STRING_to_python
+		_JSON_to_python = _STRING_to_python
 
 		def _timestamp_to_mysql(self, value, desc=None):
 			return value.strftime('%Y-%m-%d %H:%M:%S').encode(self.charset)
