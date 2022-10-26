@@ -26,8 +26,7 @@ def _mysql_converter():
 			return float(value)
 
 		def _STRING_to_python(self, value, dsc=None):
-			res = super(MySQLConverter, self)._STRING_to_python(value, dsc)
-			return res
+			return super(MySQLConverter, self)._STRING_to_python(value, dsc)
 		_VAR_STRING_to_python = _STRING_to_python
 		_JSON_to_python = _STRING_to_python
 
