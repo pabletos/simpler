@@ -37,21 +37,27 @@ def _mysql_converter():
 
 class SQL:
 	''' Connector for SQL databases with a handful of helpers. '''
-	ENGINES = 'mysql', 'mariadb', 'mssql'
+	ENGINES = 'mysql', 'mariadb', 'mssql', 'postgre'
 
 	def __init__(
-		self, host: str = 'localhost', user: str = 'root', password: str = None, db: str = None,
+		self, host: str = 'localhost', user: str = None, password: str = None, db: str = None,
 		charset: str = 'utf8mb4', collation: str = 'utf8mb4_general_ci', use_unicode: bool = True,
 		max_insertions: int = None, print_queries: bool = False, native_types: bool = True,
 		engine: str = 'mysql', force_init: bool = False
 	) -> None:
 		assert engine in SQL.ENGINES, 'Accepted engine values are: %s.' % ', '.join(SQL.ENGINES)
 		self.max_insertions, self.native_types, self.engine, self.print_queries = max_insertions, native_types, engine, print_queries
+		if user is None:
+			user = 'postgres' if engine == 'postgre' else 'root'
 		self._connection, self._cursor, self._initialized = {'user': user}, {}, False
-		if engine in ('mysql', 'mariadb'):
+		if engine == 'mysql':
 			self._init_mysql(charset, collation, host, use_unicode, password, db)
+		elif engine == 'mariadb':
+			self._init_mariadb(host, password, db)
 		elif engine == 'mssql':
 			self._init_mssql(host, password, db)
+		elif engine == 'postgre':
+			self._init_postgre(host, password, db)
 		if force_init:
 			self.cursor()
 
@@ -71,12 +77,32 @@ class SQL:
 			self._connection['db'] = db
 		self._cursor['buffered'] = True
 
+	def _init_mariadb(self, host, password, db):
+		from mariadb.constants.CLIENT import MULTI_STATEMENTS
+		from mariadb.constants.FIELD_TYPE import JSON
+		from json import loads
+
+		self._connection.update({
+			'host': host,
+			'password': password,
+			'database': db,
+			'client_flag': MULTI_STATEMENTS,
+			'converter': {JSON: loads}
+		})
+
 	def _init_mssql(self, host, password, db):
 		self._connection['server'] = host
 		if password:
 			self._connection['password'] = password
 		if db:
 			self._connection['database'] = db
+
+	def _init_postgre(self, host, password, db):
+		self._connection.update({
+			'database': db,
+			'host': host,
+			'password': password,
+		})
 
 	def close(self) -> None:
 		''' Closes the current cursor and connection. '''
@@ -89,18 +115,36 @@ class SQL:
 	def cursor(self):
 		''' Returns the open cursor and initializes the connection if required. '''
 		if not self._initialized:
-			if self.engine in ('mysql', 'mariadb'):
+			if self.engine == 'mysql':
 				try:
 					from mysql.connector import connect
 				except ModuleNotFoundError:
 					raise ModuleNotFoundError('Missing MySQL/MariaDB connector. Install a mysql client and then do `pip install mysql.connector`.')
 				if self.native_types:
 					self._connection['converter_class'] = _mysql_converter()
-			else:
+			elif self.engine == 'mariadb':
+				try:
+					from mariadb import connect
+				except ModuleNotFoundError:
+					raise ModuleNotFoundError('Missing MySQL/MariaDB connector. Install a mysql client and then do `pip install mariadb`.')
+			elif self.engine == 'mssql':
 				try:
 					from pymssql import connect
 				except ModuleNotFoundError:
 					raise ModuleNotFoundError('Missing MS-SQL connector. Install a MS-SQL client and then do `pip install pymssql`.')
+			elif self.engine == 'postgre':
+				try:
+					from psycopg2 import connect
+					from psycopg2.extras import Json
+					from psycopg2.extensions import register_adapter, register_type, new_type, DECIMAL
+					register_adapter(dict, Json)
+					register_type(new_type(
+						DECIMAL.values,
+						'DEC2FLOAT',
+						lambda value, _: float(value) if value is not None else None
+					))
+				except ModuleNotFoundError:
+					raise ModuleNotFoundError('Missing PostgreSQL connector. Install a PostgreSQL client and then do `pip install psycopg2-binary`.')
 			self._connection = connect(**self._connection)
 			self._cursor = self._connection.cursor(**self._cursor)
 			self._initialized = True
@@ -114,15 +158,26 @@ class SQL:
 		error = None
 		try:
 			if self.engine == 'mysql':
-				statement = self.cursor().execute(query, params if params is not None and len(params) else None, multi)
+				statement = self.cursor().execute(query, params if params is not None and len(params) else None, multi=multi)
 				if multi:
 					try:
 						list(statement)
 					except RuntimeError:  # see https://bugs.mysql.com/bug.php?id=87818
 						pass
-			else:
+			elif self.engine == 'mariadb':
+				# mariadb connector doesn't support adding encoders at parameter level, so we have to do JSON manually; see https://github.com/mariadb-corporation/mariadb-connector-python/blob/1.1/mariadb/cursors.py#L232 https://github.com/mariadb-corporation/mariadb-connector-python/blob/80b642b8a1a3b0b41b26e8cbe188cd91c8d1233b/mariadb/mariadb_codecs.c#L1400
+				from json import dumps
+				params = [dumps(param, ensure_ascii=False, separators=(',', ':')) if isinstance(param, dict) else param for param in params] if params is not None else None
+				self.cursor().execute(query, params if params is not None and len(params) else None)
+				if multi:
+					while self.cursor().nextset(): pass
+			elif self.engine == 'mssql':
 				assert not multi, 'MS-SQL connector does not support multistatement queries.'
-				statement = self.cursor().execute(*([query] + ([params] if params else [])))
+				self.cursor().execute(*([query] + ([params] if params else [])))
+			elif self.engine == 'postgre':
+				cursor = self.cursor()
+				self._connection.autocommit = True
+				cursor.execute(query, params if params is not None and len(params) else None)
 		except Exception as e:
 			error = e
 		if self._initialized and (commit or self.engine in ('mysql', 'mariadb')):
@@ -197,6 +252,12 @@ class SQL:
 		if res:
 			return res[0]
 
+	def exists(self, table: str, column: str, value: Any) -> bool:
+		''' Returns True if the value exists in the specified column of the specified table. '''
+		return self.find_value('SELECT 1 FROM %s WHERE %s = %%s' % (
+			table, column
+		), value) is not None
+
 	def find_column(self, query: str, *params: tuple) -> list:
 		''' Returns the value of the first column of every selected row. '''
 		return list(self.iter_column(query, *params))
@@ -208,9 +269,14 @@ class SQL:
 			yield row[0]
 
 	def insert(self, query: str, *params: tuple) -> int:
-		''' Inserts a row and returns its id. '''
+		''' Inserts a row and returns its id (if engine="postgre", you'll have to use the RETURNING keyword). '''
 		self.execute(query, params, commit=True)
-		return int(self.cursor().lastrowid)
+		if self.engine == 'postgre':
+			try:
+				return self.cursor().fetchone()
+			except:
+				return None
+		return None if self.cursor().lastrowid is None else int(self.cursor().lastrowid)
 
 	def insert_all(self, table: str, rows: Union[List[dict], List[tuple]], tuple_rows: bool = False, commit: bool = True) -> Optional[int]:
 		''' Insert a list of rows and returns the id of the last one. By default,
